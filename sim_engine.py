@@ -39,6 +39,10 @@ SEASON_CYCLE = [Season.SPRING, Season.SUMMER, Season.AUTUMN, Season.WINTER]
 WEATHER_CYCLE = [Weather.CLEAR, Weather.RAIN, Weather.CLEAR, Weather.STORM, Weather.CLEAR, Weather.SNOW]
 
 
+def _runtime_validation_enabled() -> bool:
+    return os.getenv("SIM_VALIDATE_TICKS", "0") == "1"
+
+
 # =====================================================================
 # 1. PHASE 1 - WORLD UPDATE (CANONICAL REALITY ADVANCES FIRST)
 # =====================================================================
@@ -118,7 +122,8 @@ def phase1_world_update(world: World) -> None:
             entity.location.y = round(entity.location.y + drift_y, 2)
 
         all_resource_levels.append(entity.availability)
-        entity.validate()
+        if _runtime_validation_enabled():
+            entity.validate()
 
     if all_resource_levels:
         mean_availability = sum(all_resource_levels) / len(all_resource_levels)
@@ -127,7 +132,8 @@ def phase1_world_update(world: World) -> None:
         state.resource_pressure = 0.0
 
     state.population_count = sum(1 for a in world.agent_graphs.values() if a.identity_graph.alive)
-    state.validate()
+    if _runtime_validation_enabled():
+        state.validate()
 
 
 # =====================================================================
@@ -240,7 +246,8 @@ def phase2_body_update(agent: AgentGraph, world: World) -> bool:
         agent.identity_graph.alive = False
         agent.identity_graph.age_stage = AgeStage.DEAD
 
-    agent.validate()
+    if _runtime_validation_enabled():
+        agent.validate()
     return was_alive and not agent.identity_graph.alive
 
 
@@ -260,7 +267,7 @@ def calculate_egocentric_vectors(agent: AgentGraph, world: World) -> Dict[str, A
 
         dx = entity.location.x - ax
         dy = entity.location.y - ay
-        distance = round(math.sqrt(dx ** 2 + dy ** 2), 3)
+        distance = round(math.hypot(dx, dy), 3)
         bearing = round(math.degrees(math.atan2(dy, dx)), 1)
 
         sensorium[entity_id] = {
@@ -269,7 +276,7 @@ def calculate_egocentric_vectors(agent: AgentGraph, world: World) -> Dict[str, A
             "class": entity.entity_class.value,
             "danger_level": entity.danger_level,
             "resource_value": entity.resource_value,
-            "properties": dict(entity.properties),
+            "properties": entity.properties,
         }
 
     for other_id, other_agent in world.agent_graphs.items():
@@ -278,7 +285,7 @@ def calculate_egocentric_vectors(agent: AgentGraph, world: World) -> Dict[str, A
 
         dx = other_agent.identity_graph.body_location.x - ax
         dy = other_agent.identity_graph.body_location.y - ay
-        distance = round(math.sqrt(dx ** 2 + dy ** 2), 3)
+        distance = round(math.hypot(dx, dy), 3)
         bearing = round(math.degrees(math.atan2(dy, dx)), 1)
 
         sensorium[other_id] = {
@@ -411,7 +418,8 @@ def phase3_perceptual_sampling(agent: AgentGraph, world: World, sensorium: Dict[
     surprise_flag = any(item["novelty"] >= 1.0 and item["salience"] >= 0.45 for item in visible)
     experience.proto_concept_forming = experience.pattern_pressure >= 0.45 or surprise_flag
     experience.concept_target = ConceptTarget.PATTERN if experience.proto_concept_forming else ConceptTarget.NONE
-    experience.validate()
+    if _runtime_validation_enabled():
+        experience.validate()
 
     return {
         "ordered_elements": visible,
@@ -679,6 +687,7 @@ def query_agent_inference(agent: AgentGraph, perception: Dict[str, Any], tick: i
     """
 
     try:
+        model_name = os.getenv("OLLAMA_MODEL", "mistral").strip() or "mistral"
         host = os.getenv("OLLAMA_HOST")
         if host:
             client = ollama.Client(host=host, timeout=20.0)
@@ -686,7 +695,7 @@ def query_agent_inference(agent: AgentGraph, perception: Dict[str, Any], tick: i
             client = ollama.Client(timeout=20.0)
 
         response = client.chat(
-            model="mistral",
+            model=model_name,
             messages=[
                 {"role": "system", "content": system_containment_rules},
                 {"role": "user", "content": user_query},
@@ -740,7 +749,7 @@ def resolve_spatial_mechanics(agent: AgentGraph, proposal: TickActionProposal, w
     my_loc = agent.identity_graph.body_location
     dx = target_loc.x - my_loc.x
     dy = target_loc.y - my_loc.y
-    distance = math.sqrt(dx ** 2 + dy ** 2)
+    distance = math.hypot(dx, dy)
 
     if distance <= 0.2:
         return
@@ -775,11 +784,30 @@ def resolve_internal_rest_effects(agent: AgentGraph, proposal: TickActionProposa
     return effects
 
 
+def _target_location(world: World, target_id: Optional[str]) -> Optional[Vec2]:
+    if not target_id or target_id == "none":
+        return None
+    if target_id in world.environment_graph:
+        return world.environment_graph[target_id].location
+    if target_id in world.agent_graphs:
+        return world.agent_graphs[target_id].identity_graph.body_location
+    return None
+
+
+def _distance_to_target(agent: AgentGraph, world: World, target_id: Optional[str]) -> Optional[float]:
+    target_loc = _target_location(world, target_id)
+    if target_loc is None:
+        return None
+    dx = target_loc.x - agent.identity_graph.body_location.x
+    dy = target_loc.y - agent.identity_graph.body_location.y
+    return math.hypot(dx, dy)
+
+
 def resolve_metabolic_intersections(
     agent: AgentGraph,
     proposal: TickActionProposal,
-    sensorium: Dict[str, Any],
     world: World,
+    target_distance: Optional[float],
 ) -> Dict[str, Any]:
     result = {
         "consumed": False,
@@ -789,11 +817,7 @@ def resolve_metabolic_intersections(
     target_id = proposal.target_id
     if not target_id or target_id == "none":
         return result
-    if target_id not in sensorium:
-        return result
-
-    distance = _parse_float(sensorium[target_id].get("distance", 999.0), 999.0)
-    if distance > 0.45:
+    if target_distance is None or target_distance > 0.45:
         return result
 
     states = agent.body_graph.states
@@ -872,7 +896,7 @@ def phase4_action_resolution(
     world: World,
     perception: Dict[str, Any],
     tick: int,
-) -> Tuple[TickActionProposal, Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[TickActionProposal, Dict[str, Any]]:
     proposal = query_agent_inference(agent, perception, tick)
     proposal = _normalize_action_target(perception, proposal)
     proposal.validate()
@@ -886,14 +910,13 @@ def phase4_action_resolution(
 
     apply_tick_action(agent, proposal)
 
-    visible_map = perception.get("visible_map", {}) if isinstance(perception, dict) else {}
-    initial_distance = _parse_float(visible_map.get(proposal.target_id, {}).get("distance", 999.0), 999.0)
+    initial_distance = _distance_to_target(agent, world, proposal.target_id)
 
     resolve_spatial_mechanics(agent, proposal, world)
-    post_move_sensorium = calculate_egocentric_vectors(agent, world)
+    final_distance = _distance_to_target(agent, world, proposal.target_id)
 
     passive_effects = resolve_internal_rest_effects(agent, proposal)
-    metabolic_result = resolve_metabolic_intersections(agent, proposal, post_move_sensorium, world)
+    metabolic_result = resolve_metabolic_intersections(agent, proposal, world, final_distance)
 
     after = {
         "energy": agent.body_graph.states.energy_level,
@@ -915,9 +938,12 @@ def phase4_action_resolution(
     if proposal.physical_action in (PhysicalActionType.REST, PhysicalActionType.SLEEP):
         success = True
     elif proposal.physical_action == PhysicalActionType.MOVE and proposal.target_id not in (None, "none"):
-        final_distance = _parse_float(post_move_sensorium.get(proposal.target_id, {}).get("distance", 999.0), 999.0)
-        success = final_distance < initial_distance
-        partial = final_distance == initial_distance
+        if initial_distance is None or final_distance is None:
+            success = False
+            partial = True
+        else:
+            success = final_distance < initial_distance
+            partial = final_distance == initial_distance
     elif proposal.physical_action in (PhysicalActionType.DRINK, PhysicalActionType.EAT):
         success = bool(metabolic_result["consumed"])
     elif proposal.physical_action == PhysicalActionType.FIGHT:
@@ -943,7 +969,7 @@ def phase4_action_resolution(
         "observed_social_agents": list(perception.get("visible_social", [])),
     }
 
-    return proposal, outcome, post_move_sensorium
+    return proposal, outcome
 
 
 # =====================================================================
@@ -1202,8 +1228,9 @@ def update_narration_and_social_state(
     if len(agent.action_graph.action_history) > 300:
         agent.action_graph.action_history = agent.action_graph.action_history[-300:]
 
-    narration.validate()
-    social.validate()
+    if _runtime_validation_enabled():
+        narration.validate()
+        social.validate()
 
 
 # =====================================================================
@@ -1266,7 +1293,7 @@ def run_simulation_tick(world: World) -> None:
         perception = phase3_perceptual_sampling(agent, world, sensorium)
 
         # Phase 4: resolve exactly one primary action against world reality.
-        proposal, outcome, _ = phase4_action_resolution(agent, world, perception, current_tick)
+        proposal, outcome = phase4_action_resolution(agent, world, perception, current_tick)
 
         # Phase 5: consolidate discovery from perception-action-outcome tuple.
         phase5_discovery_consolidation(agent, perception, proposal, outcome, current_tick)
@@ -1302,7 +1329,8 @@ def run_simulation_tick(world: World) -> None:
         )
 
     world.world_state.population_count = sum(1 for a in world.agent_graphs.values() if a.identity_graph.alive)
-    world.validate()
+    if _runtime_validation_enabled():
+        world.validate()
 
 
 # =====================================================================

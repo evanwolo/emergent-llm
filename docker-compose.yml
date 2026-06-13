@@ -31,6 +31,27 @@ services:
         fi
     restart: "no"
 
+  ollama-interpreter-init:
+    image: ollama/ollama:latest
+    profiles: ["llm"]
+    depends_on:
+      ollama-pull:
+        condition: service_completed_successfully
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    volumes:
+      - ./Modelfile.interpreter:/tmp/Modelfile.interpreter:ro
+    entrypoint: ["/bin/sh", "-lc"]
+    command:
+      - |
+        if ollama list | grep -q '^sim-interpreter:'; then
+          echo 'sim-interpreter already present; skipping create'
+        else
+          echo 'sim-interpreter missing; creating from Modelfile.interpreter'
+          ollama create sim-interpreter -f /tmp/Modelfile.interpreter
+        fi
+    restart: "no"
+
   simulation:
     build:
       context: .
@@ -46,9 +67,10 @@ services:
     profiles: ["llm"]
     environment:
       OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: mistral
       SIM_FORCE_HEURISTIC: "0"
     depends_on:
-      ollama-pull:
+      ollama-interpreter-init:
         condition: service_completed_successfully
     restart: "no"
 
