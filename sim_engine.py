@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
 import os
+from threading import Lock
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import ollama
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 from agent_types import (
     AgentGraph,
@@ -91,9 +98,89 @@ def _interpreter_interval_ticks() -> int:
     return _env_int("SIM_INTERPRETER_INTERVAL_TICKS", 5, minimum=1)
 
 
+def _vectorized_sensorium_enabled() -> bool:
+    return np is not None and os.getenv("SIM_VECTORIZE_SENSORIUM", "1") == "1"
+
+
+def _sparse_inference_enabled() -> bool:
+    return os.getenv("SIM_SPARSE_INFERENCE", "1") == "1"
+
+
+def _sparse_novelty_threshold() -> float:
+    return clamp01(_env_float("SIM_SPARSE_NOVELTY_THRESHOLD", 0.5, minimum=0.0))
+
+
 INTERPRETER_BOOTSTRAP_EVENT_ID = "simulation_bootstrap"
 _INFERENCE_COOLDOWN_UNTIL_TICK = -1
 _INTERPRETER_COOLDOWN_UNTIL_TICK = -1
+_COOLDOWN_LOCK = Lock()
+
+
+def _event_log_max_records() -> int:
+    return _env_int("SIM_EVENT_LOG_MAX_RECORDS", 1000, minimum=0)
+
+
+def _inference_max_workers() -> int:
+    return _env_int("SIM_INFERENCE_MAX_WORKERS", 4, minimum=1)
+
+
+def _trim_event_log(world: World) -> None:
+    max_records = _event_log_max_records()
+    if max_records <= 0:
+        return
+    if len(world.event_log) <= max_records:
+        return
+
+    bootstrap_event: Optional[EventRecord] = None
+    for event in world.event_log:
+        if event.event_id == INTERPRETER_BOOTSTRAP_EVENT_ID and event.event_type == "simulation_bootstrap":
+            bootstrap_event = event
+            break
+
+    retained = world.event_log[-max_records:]
+    if bootstrap_event is None or bootstrap_event in retained:
+        world.event_log = retained
+        return
+
+    retained = [event for event in retained if event is not bootstrap_event]
+    world.event_log = [bootstrap_event] + retained
+
+
+def _append_event(world: World, event: EventRecord) -> None:
+    world.event_log.append(event)
+    _trim_event_log(world)
+
+
+def _batch_query_agent_inference(
+    entries: List[Tuple[str, AgentGraph, Dict[str, Any]]],
+    tick: int,
+) -> Dict[str, TickActionProposal]:
+    if not entries:
+        return {}
+
+    max_workers = min(len(entries), _inference_max_workers())
+    proposals: Dict[str, TickActionProposal] = {}
+
+    if max_workers <= 1:
+        for agent_id, agent, perception in entries:
+            proposals[agent_id] = query_agent_inference(agent, perception, tick)
+        return proposals
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_context = {
+            executor.submit(query_agent_inference, agent, perception, tick): (agent_id, agent, perception)
+            for agent_id, agent, perception in entries
+        }
+
+        for future in as_completed(future_to_context):
+            agent_id, agent, perception = future_to_context[future]
+            try:
+                proposals[agent_id] = future.result()
+            except Exception:
+                visible_map = perception.get("visible_map", {}) if isinstance(perception, dict) else {}
+                proposals[agent_id] = _heuristic_proposal(agent, visible_map)
+
+    return proposals
 
 
 # =====================================================================
@@ -313,6 +400,65 @@ def calculate_egocentric_vectors(agent: AgentGraph, world: World) -> Dict[str, A
     ax = agent.identity_graph.body_location.x
     ay = agent.identity_graph.body_location.y
     sensorium: Dict[str, Any] = {}
+
+    if _vectorized_sensorium_enabled():
+        environment_entries = [
+            (entity_id, entity)
+            for entity_id, entity in world.environment_graph.items()
+            if entity.exists
+        ]
+
+        if environment_entries:
+            env_locations = np.array(
+                [(entry.location.x, entry.location.y) for _, entry in environment_entries],
+                dtype=np.float64,
+            )
+            env_deltas = env_locations - np.array([ax, ay], dtype=np.float64)
+            env_distances = np.hypot(env_deltas[:, 0], env_deltas[:, 1])
+            env_bearings = np.degrees(np.arctan2(env_deltas[:, 1], env_deltas[:, 0]))
+
+            for idx, (entity_id, entity) in enumerate(environment_entries):
+                sensorium[entity_id] = {
+                    "distance": round(float(env_distances[idx]), 3),
+                    "bearing": round(float(env_bearings[idx]), 1),
+                    "class": entity.entity_class.value,
+                    "danger_level": entity.danger_level,
+                    "resource_value": entity.resource_value,
+                    "properties": entity.properties,
+                }
+
+        other_agent_entries = [
+            (other_id, other_agent)
+            for other_id, other_agent in world.agent_graphs.items()
+            if other_id != agent.identity_graph.agent_id and other_agent.identity_graph.alive
+        ]
+
+        if other_agent_entries:
+            other_locations = np.array(
+                [
+                    (other.identity_graph.body_location.x, other.identity_graph.body_location.y)
+                    for _, other in other_agent_entries
+                ],
+                dtype=np.float64,
+            )
+            other_deltas = other_locations - np.array([ax, ay], dtype=np.float64)
+            other_distances = np.hypot(other_deltas[:, 0], other_deltas[:, 1])
+            other_bearings = np.degrees(np.arctan2(other_deltas[:, 1], other_deltas[:, 0]))
+
+            for idx, (other_id, other_agent) in enumerate(other_agent_entries):
+                sensorium[other_id] = {
+                    "distance": round(float(other_distances[idx]), 3),
+                    "bearing": round(float(other_bearings[idx]), 1),
+                    "class": EntityClass.AGENT_BODY.value,
+                    "danger_level": other_agent.body_graph.states.threat_response,
+                    "resource_value": 0.0,
+                    "properties": {
+                        "somatic_age_ticks": float(other_agent.identity_graph.age_ticks),
+                        "alive": float(1.0 if other_agent.identity_graph.alive else 0.0),
+                    },
+                }
+
+        return sensorium
 
     for entity_id, entity in world.environment_graph.items():
         if not entity.exists:
@@ -701,6 +847,51 @@ def _heuristic_proposal(agent: AgentGraph, visible_map: Dict[str, Any]) -> TickA
     )
 
 
+def _has_locked_target_discovery(agent: AgentGraph, target_id: str) -> bool:
+    if not target_id or target_id == "none":
+        return False
+
+    target_marker = f"_{target_id.upper()}_"
+    for relation in agent.discovery_graph.stabilized_relations:
+        if target_marker in relation:
+            return True
+
+    return False
+
+
+def _current_attention_target(agent: AgentGraph, perception: Dict[str, Any]) -> str:
+    primary_attention = str(agent.experience_graph.primary_attention or "none")
+    if primary_attention != "none":
+        return primary_attention
+
+    ordered = perception.get("ordered_elements", []) if isinstance(perception, dict) else []
+    if ordered:
+        return str(ordered[0].get("entity_id", "none") or "none")
+
+    return "none"
+
+
+def _should_use_llm_inference(agent: AgentGraph, perception: Dict[str, Any]) -> bool:
+    if not _sparse_inference_enabled():
+        return True
+
+    surprise_flag = bool(perception.get("surprise_flag", False)) if isinstance(perception, dict) else False
+    if surprise_flag:
+        return True
+
+    if bool(agent.experience_graph.proto_concept_forming):
+        return True
+
+    if agent.experience_graph.novelty_signal >= _sparse_novelty_threshold():
+        return True
+
+    target_id = _current_attention_target(agent, perception)
+    if _has_locked_target_discovery(agent, target_id):
+        return False
+
+    return True
+
+
 def query_agent_inference(agent: AgentGraph, perception: Dict[str, Any], tick: int) -> TickActionProposal:
     global _INFERENCE_COOLDOWN_UNTIL_TICK
 
@@ -709,7 +900,13 @@ def query_agent_inference(agent: AgentGraph, perception: Dict[str, Any], tick: i
     if os.getenv("SIM_FORCE_HEURISTIC", "0") == "1":
         return _heuristic_proposal(agent, visible_map)
 
-    if tick <= _INFERENCE_COOLDOWN_UNTIL_TICK:
+    if not _should_use_llm_inference(agent, perception):
+        return _heuristic_proposal(agent, visible_map)
+
+    with _COOLDOWN_LOCK:
+        inference_cooldown_until_tick = _INFERENCE_COOLDOWN_UNTIL_TICK
+
+    if tick <= inference_cooldown_until_tick:
         return _heuristic_proposal(agent, visible_map)
 
     system_containment_rules = """
@@ -768,10 +965,11 @@ def query_agent_inference(agent: AgentGraph, perception: Dict[str, Any], tick: i
             return _heuristic_proposal(agent, visible_map)
         return _proposal_from_parsed(parsed)
     except Exception:
-        _INFERENCE_COOLDOWN_UNTIL_TICK = max(
-            _INFERENCE_COOLDOWN_UNTIL_TICK,
-            tick + _inference_cooldown_ticks(),
-        )
+        with _COOLDOWN_LOCK:
+            _INFERENCE_COOLDOWN_UNTIL_TICK = max(
+                _INFERENCE_COOLDOWN_UNTIL_TICK,
+                tick + _inference_cooldown_ticks(),
+            )
         return _heuristic_proposal(agent, visible_map)
 
 
@@ -959,8 +1157,9 @@ def phase4_action_resolution(
     world: World,
     perception: Dict[str, Any],
     tick: int,
+    precomputed_proposal: Optional[TickActionProposal] = None,
 ) -> Tuple[TickActionProposal, Dict[str, Any]]:
-    proposal = query_agent_inference(agent, perception, tick)
+    proposal = precomputed_proposal or query_agent_inference(agent, perception, tick)
     proposal = _normalize_action_target(perception, proposal)
     proposal.validate()
 
@@ -1406,6 +1605,11 @@ def _simulation_configuration_snapshot() -> Dict[str, Any]:
             "sim_interpreter_timeout_seconds": _interpreter_timeout_seconds(),
             "sim_interpreter_cooldown_ticks": _interpreter_cooldown_ticks(),
             "sim_interpreter_interval_ticks": _interpreter_interval_ticks(),
+            "sim_event_log_max_records": _event_log_max_records(),
+            "sim_inference_max_workers": _inference_max_workers(),
+            "sim_vectorize_sensorium": _vectorized_sensorium_enabled(),
+            "sim_sparse_inference": _sparse_inference_enabled(),
+            "sim_sparse_novelty_threshold": _sparse_novelty_threshold(),
         },
         "world_cycles": {
             "time_of_day": [entry.value for entry in TIME_CYCLE],
@@ -1423,7 +1627,8 @@ def _ensure_interpreter_bootstrap_event(world: World) -> None:
         if event.event_id == INTERPRETER_BOOTSTRAP_EVENT_ID and event.event_type == "simulation_bootstrap":
             return
 
-    world.event_log.append(
+    _append_event(
+        world,
         EventRecord(
             event_id=INTERPRETER_BOOTSTRAP_EVENT_ID,
             tick=world.world_state.tick,
@@ -1434,7 +1639,7 @@ def _ensure_interpreter_bootstrap_event(world: World) -> None:
                 "initial_sim_state": _serialize_world_snapshot(world),
                 "simulation_configuration": _simulation_configuration_snapshot(),
             },
-        )
+        ),
     )
 
 
@@ -1494,7 +1699,10 @@ def _query_tick_interpreter(payload: Dict[str, Any]) -> str:
     global _INTERPRETER_COOLDOWN_UNTIL_TICK
 
     tick = int(payload.get("tick", 0))
-    if tick <= _INTERPRETER_COOLDOWN_UNTIL_TICK:
+    with _COOLDOWN_LOCK:
+        interpreter_cooldown_until_tick = _INTERPRETER_COOLDOWN_UNTIL_TICK
+
+    if tick <= interpreter_cooldown_until_tick:
         return _heuristic_interpreter_summary(payload)
 
     system_instruction = """
@@ -1538,10 +1746,11 @@ def _query_tick_interpreter(payload: Dict[str, Any]) -> str:
         summary = str(response.get("message", {}).get("content", "")).strip()
         return summary or _heuristic_interpreter_summary(payload)
     except Exception:
-        _INTERPRETER_COOLDOWN_UNTIL_TICK = max(
-            _INTERPRETER_COOLDOWN_UNTIL_TICK,
-            tick + _interpreter_cooldown_ticks(),
-        )
+        with _COOLDOWN_LOCK:
+            _INTERPRETER_COOLDOWN_UNTIL_TICK = max(
+                _INTERPRETER_COOLDOWN_UNTIL_TICK,
+                tick + _interpreter_cooldown_ticks(),
+            )
         return _heuristic_interpreter_summary(payload)
 
 
@@ -1555,7 +1764,8 @@ def _append_interpreter_summary_event(world: World, tick: int, tick_events: List
 
     payload = _build_interpreter_tick_payload(world, tick, tick_events)
     summary = _query_tick_interpreter(payload)
-    world.event_log.append(
+    _append_event(
+        world,
         EventRecord(
             event_id=f"interpreter_tick_{tick}",
             tick=tick,
@@ -1570,13 +1780,14 @@ def _append_interpreter_summary_event(world: World, tick: int, tick_events: List
                     "simulation_configuration": bool(payload.get("simulation_configuration")),
                 },
             },
-        )
+        ),
     )
 
 
 def export_agent_visible_state(agent: AgentGraph, world: World) -> Dict[str, Any]:
-    agent.validate()
-    world.validate()
+    if _runtime_validation_enabled():
+        agent.validate()
+        world.validate()
     return {
         "identity": {
             "agent_id": agent.identity_graph.agent_id,
@@ -1615,6 +1826,8 @@ def run_simulation_tick(world: World) -> None:
     world.world_state.birth_count = 0
     world.world_state.death_count = 0
 
+    active_agents: List[Tuple[str, AgentGraph, Dict[str, Any]]] = []
+
     for agent_id, agent in world.agent_graphs.items():
         if not agent.identity_graph.alive:
             continue
@@ -1631,8 +1844,24 @@ def run_simulation_tick(world: World) -> None:
         sensorium = calculate_egocentric_vectors(agent, world)
         perception = phase3_perceptual_sampling(agent, world, sensorium)
 
+        active_agents.append((agent_id, agent, perception))
+
+    proposals = _batch_query_agent_inference(active_agents, current_tick)
+
+    for agent_id, agent, perception in active_agents:
+        proposal = proposals.get(agent_id)
+        if proposal is None:
+            visible_map = perception.get("visible_map", {}) if isinstance(perception, dict) else {}
+            proposal = _heuristic_proposal(agent, visible_map)
+
         # Phase 4: resolve exactly one primary action against world reality.
-        proposal, outcome = phase4_action_resolution(agent, world, perception, current_tick)
+        proposal, outcome = phase4_action_resolution(
+            agent,
+            world,
+            perception,
+            current_tick,
+            precomputed_proposal=proposal,
+        )
 
         # Phase 5: consolidate discovery from perception-action-outcome tuple.
         phase5_discovery_consolidation(agent, perception, proposal, outcome, current_tick)
@@ -1664,7 +1893,7 @@ def run_simulation_tick(world: World) -> None:
                 },
             },
         )
-        world.event_log.append(tick_event)
+        _append_event(world, tick_event)
         tick_events.append(tick_event)
 
     world.world_state.population_count = sum(1 for a in world.agent_graphs.values() if a.identity_graph.alive)
