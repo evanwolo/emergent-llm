@@ -18,23 +18,30 @@ except ImportError:
 
 from agent_types import (
     AgentGraph,
+    BeliefNode,
     DiscoveryNode,
     DiscoveryStatus,
     EpisodicMemoryNode,
     IdentityGraph,
+    ReflectionEvent,
     SocialNode,
 )
 from common import Vec2, clamp01
 from enums import (
     AgeStage,
+    BeliefDomain,
+    BeliefSource,
+    BeliefStatus,
     ConceptTarget,
     DirectionType,
     EntityClass,
     PhysicalActionType,
     ProcessingMode,
+    RevisionOutcome,
     Season,
     Sex,
     TimeOfDay,
+    TriggerType,
     Weather,
 )
 from environment_types import EnvironmentEntity
@@ -108,6 +115,22 @@ def _sparse_inference_enabled() -> bool:
 
 def _sparse_novelty_threshold() -> float:
     return clamp01(_env_float("SIM_SPARSE_NOVELTY_THRESHOLD", 0.5, minimum=0.0))
+
+
+def _belief_memory_bias() -> float:
+    return clamp01(_env_float("SIM_MEMORY_SALIENCE_BIAS", 0.08, minimum=0.0))
+
+
+def _belief_revision_trigger_tension() -> float:
+    return clamp01(_env_float("SIM_BELIEF_REVISION_TRIGGER", 0.5, minimum=0.0))
+
+
+def _belief_lock_confidence_threshold() -> float:
+    return clamp01(_env_float("SIM_BELIEF_LOCK_CONFIDENCE", 0.9, minimum=0.0))
+
+
+def _belief_lock_coherence_threshold() -> float:
+    return clamp01(_env_float("SIM_BELIEF_LOCK_COHERENCE", 0.8, minimum=0.0))
 
 
 INTERPRETER_BOOTSTRAP_EVENT_ID = "simulation_bootstrap"
@@ -547,6 +570,9 @@ def phase3_perceptual_sampling(agent: AgentGraph, world: World, sensorium: Dict[
         novelty_signal = 0.0 if pattern_key in seen_patterns else 1.0
         prior_node = agent.discovery_graph.discoveries.get(entity_id)
         prior_confidence = prior_node.discovery_confidence if prior_node else 0.0
+        memory_bias = _belief_memory_bias()
+        trauma_bias = -memory_bias if entity_id in agent.memory_graph.trauma_memory else 0.0
+        beauty_bias = memory_bias if entity_id in agent.memory_graph.beauty_memory else 0.0
 
         salience = clamp01(
             (0.30 * proximity)
@@ -555,10 +581,19 @@ def phase3_perceptual_sampling(agent: AgentGraph, world: World, sensorium: Dict[
             + (0.10 * resource_signal)
             + (0.10 * novelty_signal)
             + (0.10 * prior_confidence)
+            + trauma_bias
+            + beauty_bias
         )
 
-        relief_potential = clamp01(resource_signal * max(agent.body_graph.drives.drive_eat, agent.body_graph.drives.drive_drink))
-        pain_potential = clamp01(danger_signal + (agent.body_graph.states.pain_level * 0.3))
+        relief_potential = clamp01(
+            (resource_signal * max(agent.body_graph.drives.drive_eat, agent.body_graph.drives.drive_drink))
+            + max(0.0, beauty_bias)
+        )
+        pain_potential = clamp01(
+            danger_signal
+            + (agent.body_graph.states.pain_level * 0.3)
+            + max(0.0, -trauma_bias)
+        )
 
         scored.append(
             {
@@ -871,6 +906,98 @@ def _current_attention_target(agent: AgentGraph, perception: Dict[str, Any]) -> 
     return "none"
 
 
+def _is_threat_relation(label: str) -> bool:
+    lowered = label.lower()
+    return any(token in lowered for token in ("threat", "danger", "harm", "flee", "fight", "conflict"))
+
+
+def _belief_domain_for_discovery(discovery: DiscoveryNode) -> BeliefDomain:
+    target = discovery.discovered_target.lower()
+    relation = discovery.discovered_relation.lower()
+
+    if target.startswith("agt_") or "observed::agt_" in target:
+        return BeliefDomain.OTHER
+    if any(token in relation for token in ("hunger", "thirst", "pain", "fatigue", "sleep")):
+        return BeliefDomain.BODY
+    return BeliefDomain.WORLD
+
+
+def _belief_key_for_discovery(discovery: DiscoveryNode) -> Tuple[str, str]:
+    belief_id = f"belief::{discovery.discovered_target}::{discovery.discovered_relation}"
+    content_label = f"{discovery.discovered_target}:{discovery.discovered_relation}"
+    return belief_id, content_label
+
+
+def _find_belief_node(agent: AgentGraph, belief_id: str, content_label: str) -> Tuple[Optional[str], Optional[str], Optional[BeliefNode]]:
+    belief_graph = agent.belief_graph
+    buckets = (
+        ("proto", belief_graph.proto_beliefs),
+        ("stable", belief_graph.stable_beliefs),
+        ("locked", belief_graph.locked_convictions),
+    )
+
+    for bucket_name, bucket in buckets:
+        if belief_id in bucket:
+            return bucket_name, belief_id, bucket[belief_id]
+
+    for bucket_name, bucket in buckets:
+        for existing_id, node in bucket.items():
+            if node.content_label == content_label:
+                return bucket_name, existing_id, node
+
+    return None, None, None
+
+
+def _set_belief_bucket(agent: AgentGraph, belief_id: str, belief: BeliefNode, bucket_name: str) -> None:
+    belief_graph = agent.belief_graph
+    belief_graph.proto_beliefs.pop(belief_id, None)
+    belief_graph.stable_beliefs.pop(belief_id, None)
+    belief_graph.locked_convictions.pop(belief_id, None)
+
+    if bucket_name == "locked":
+        belief_graph.locked_convictions[belief_id] = belief
+    elif bucket_name == "stable":
+        belief_graph.stable_beliefs[belief_id] = belief
+    else:
+        belief_graph.proto_beliefs[belief_id] = belief
+
+
+def _append_unique_limited(entries: List[str], value: str, limit: int = 128) -> None:
+    if value in entries:
+        return
+    entries.append(value)
+    if len(entries) > limit:
+        del entries[:-limit]
+
+
+def _belief_is_threat_node(belief: BeliefNode) -> bool:
+    return _is_threat_relation(belief.content_label)
+
+
+def _stable_threshold_for_belief(agent: AgentGraph, belief: BeliefNode) -> float:
+    base = 0.65
+    if _belief_is_threat_node(belief):
+        base += agent.identity_graph.baseline_temperament.fearfulness * 0.15
+    return clamp01(base)
+
+
+def _proto_creation_threshold(agent: AgentGraph) -> float:
+    curiosity = agent.identity_graph.baseline_temperament.curiosity
+    return clamp01(0.55 - (curiosity * 0.30))
+
+
+def _belief_opposition_ratio(belief: BeliefNode) -> float:
+    support = len(belief.supporting_discoveries)
+    oppose = len(belief.opposing_discoveries)
+    if support + oppose <= 0:
+        return 0.0
+    return clamp01(oppose / float(support + oppose))
+
+
+def _has_locked_threat_conviction(agent: AgentGraph) -> bool:
+    return any(_belief_is_threat_node(belief) for belief in agent.belief_graph.locked_convictions.values())
+
+
 def _should_use_llm_inference(agent: AgentGraph, perception: Dict[str, Any]) -> bool:
     if not _sparse_inference_enabled():
         return True
@@ -1161,6 +1288,11 @@ def phase4_action_resolution(
 ) -> Tuple[TickActionProposal, Dict[str, Any]]:
     proposal = precomputed_proposal or query_agent_inference(agent, perception, tick)
     proposal = _normalize_action_target(perception, proposal)
+
+    if proposal.physical_action == PhysicalActionType.FIGHT and _has_locked_threat_conviction(agent):
+        aggression = agent.identity_graph.baseline_temperament.aggression
+        proposal.intensity = clamp01(max(proposal.intensity, 0.35) + 0.10 + (aggression * 0.25))
+
     proposal.validate()
 
     before = {
@@ -1389,6 +1521,208 @@ def phase5_discovery_consolidation(
     )
 
 
+def phase5_belief_promotion(agent: AgentGraph, tick: int) -> None:
+    belief_graph = agent.belief_graph
+    curiosity = agent.identity_graph.baseline_temperament.curiosity
+    proto_creation_threshold = _proto_creation_threshold(agent)
+
+    for discovery_id in sorted(agent.discovery_graph.discoveries.keys()):
+        discovery = agent.discovery_graph.discoveries[discovery_id]
+        is_locked_discovery = discovery.status == DiscoveryStatus.LOCKED
+
+        if not is_locked_discovery and discovery.discovery_confidence < proto_creation_threshold:
+            continue
+        if not is_locked_discovery and discovery.times_confirmed <= 0:
+            continue
+
+        belief_id, content_label = _belief_key_for_discovery(discovery)
+        bucket_name, existing_id, belief = _find_belief_node(agent, belief_id, content_label)
+        resolved_belief_id = existing_id or belief_id
+
+        if belief is None:
+            seed_confidence = (
+                (0.40 + (curiosity * 0.10))
+                if is_locked_discovery
+                else max(0.20, discovery.discovery_confidence * (0.45 + (curiosity * 0.25)))
+            )
+
+            total_attempts = discovery.times_confirmed + discovery.times_failed
+            success_rate = (discovery.times_confirmed / total_attempts) if total_attempts > 0 else discovery.discovery_confidence
+            support_token = f"{discovery_id}:c{discovery.times_confirmed}"
+
+            belief = BeliefNode(
+                belief_id=resolved_belief_id,
+                content_label=content_label,
+                domain=_belief_domain_for_discovery(discovery),
+                source=BeliefSource.EXPERIENCE,
+                confidence=round(clamp01(seed_confidence), 3),
+                coherence=round(clamp01(success_rate), 3),
+                success_rate=round(clamp01(success_rate), 3),
+                identity_weight=round(
+                    clamp01((seed_confidence * 0.50) + (0.20 if _is_threat_relation(content_label) else 0.08)),
+                    3,
+                ),
+                status=BeliefStatus.PROTO,
+                supporting_discoveries=[support_token] if discovery.times_confirmed > 0 else [],
+                opposing_discoveries=[],
+                created_tick=tick,
+                last_revised_tick=tick,
+            )
+
+            if discovery.times_failed > 0:
+                _append_unique_limited(belief.opposing_discoveries, f"{discovery_id}:f{discovery.times_failed}")
+
+            bucket_name = "proto"
+        else:
+            support_token = f"{discovery_id}:c{discovery.times_confirmed}"
+            oppose_token = f"{discovery_id}:f{discovery.times_failed}"
+
+            if discovery.times_confirmed > 0 and support_token not in belief.supporting_discoveries:
+                _append_unique_limited(belief.supporting_discoveries, support_token)
+                belief.confidence = round(clamp01(belief.confidence + (0.12 if is_locked_discovery else 0.06)), 3)
+
+            if discovery.times_failed > 0 and oppose_token not in belief.opposing_discoveries:
+                _append_unique_limited(belief.opposing_discoveries, oppose_token)
+                belief.confidence = round(clamp01(belief.confidence - 0.08), 3)
+
+            total_attempts = discovery.times_confirmed + discovery.times_failed
+            if total_attempts > 0:
+                success_rate = discovery.times_confirmed / total_attempts
+                belief.success_rate = round(clamp01(success_rate), 3)
+                belief.coherence = round(clamp01((belief.coherence * 0.55) + (success_rate * 0.45)), 3)
+
+            belief.identity_weight = round(
+                clamp01((belief.identity_weight * 0.70) + (belief.confidence * 0.30)),
+                3,
+            )
+            belief.last_revised_tick = tick
+
+        stable_threshold = _stable_threshold_for_belief(agent, belief)
+        lock_confidence_threshold = _belief_lock_confidence_threshold()
+        lock_coherence_threshold = _belief_lock_coherence_threshold()
+
+        if belief.confidence >= lock_confidence_threshold and belief.coherence >= lock_coherence_threshold:
+            belief.status = BeliefStatus.LOCKED
+            bucket_name = "locked"
+        elif belief.confidence >= stable_threshold:
+            belief.status = BeliefStatus.STABLE
+            bucket_name = "stable"
+        else:
+            belief.status = BeliefStatus.PROTO
+            bucket_name = "proto"
+
+        relation_edge = (resolved_belief_id, discovery.discovered_target, discovery.discovered_relation)
+        if relation_edge not in belief_graph.belief_relations:
+            belief_graph.belief_relations.append(relation_edge)
+            if len(belief_graph.belief_relations) > 256:
+                belief_graph.belief_relations = belief_graph.belief_relations[-256:]
+
+        belief.validate()
+        _set_belief_bucket(agent, resolved_belief_id, belief, bucket_name)
+
+
+def phase5_belief_revision(agent: AgentGraph, tick: int) -> None:
+    reflection = agent.reflection_graph
+    temperament = agent.identity_graph.baseline_temperament
+    candidates: List[Tuple[float, str, BeliefNode]] = []
+
+    for bucket in (agent.belief_graph.proto_beliefs, agent.belief_graph.stable_beliefs, agent.belief_graph.locked_convictions):
+        for belief_id, belief in bucket.items():
+            ratio = _belief_opposition_ratio(belief)
+            if ratio > 0.0:
+                candidates.append((ratio, belief_id, belief))
+
+    if not candidates:
+        reflection.presupposition_detected = False
+        reflection.self_questioning_active = False
+        reflection.current_target_belief = None
+        reflection.candidate_revision = None
+        reflection.belief_tension = round(clamp01(reflection.belief_tension * 0.85), 3)
+        reflection.revision_pressure = round(clamp01(reflection.revision_pressure * 0.80), 3)
+        reflection.identity_cost = round(clamp01(reflection.identity_cost * 0.80), 3)
+        reflection.validate()
+        return
+
+    ratio, belief_id, belief = max(candidates, key=lambda item: item[0])
+    tension = clamp01(max(ratio, reflection.belief_tension * 0.75))
+
+    reflection.belief_tension = round(tension, 3)
+    reflection.current_target_belief = belief_id
+    reflection.candidate_revision = f"revisit::{belief.content_label}"
+
+    patience_threshold = clamp01(0.35 + (temperament.patience * 0.25))
+    if tension < patience_threshold or tension <= _belief_revision_trigger_tension():
+        reflection.presupposition_detected = False
+        reflection.self_questioning_active = False
+        reflection.revision_pressure = round(clamp01(tension), 3)
+        reflection.validate()
+        return
+
+    reflection.presupposition_detected = True
+    reflection.self_questioning_active = True
+    reflection.last_reflection_tick = tick
+    reflection.identity_cost = round(clamp01(belief.identity_weight), 3)
+    reflection.revision_pressure = round(clamp01(tension * (1.0 - (temperament.patience * 0.20))), 3)
+    reflection.locked_belief_resistance = round(
+        clamp01((reflection.locked_belief_resistance * 0.70) + (temperament.patience * 0.30)),
+        3,
+    )
+
+    old_confidence = belief.confidence
+    old_status = belief.status
+
+    if (
+        belief.status == BeliefStatus.LOCKED
+        and (reflection.locked_belief_resistance + (reflection.identity_cost * 0.40)) >= reflection.revision_pressure
+    ):
+        belief.confidence = round(clamp01(belief.confidence + 0.02), 3)
+        reflection.locked_belief_resistance = round(clamp01(reflection.locked_belief_resistance + 0.04), 3)
+        revision_outcome = RevisionOutcome.LOCKED_HARDER
+    else:
+        confidence_penalty = 0.06 + (reflection.revision_pressure * 0.16)
+        belief.confidence = round(clamp01(belief.confidence - confidence_penalty), 3)
+        revision_outcome = RevisionOutcome.REVISED
+
+        if old_status == BeliefStatus.LOCKED and belief.confidence < _belief_lock_confidence_threshold():
+            belief.status = BeliefStatus.STABLE
+            revision_outcome = RevisionOutcome.WEAKENED
+
+        if belief.status == BeliefStatus.STABLE and belief.confidence < _stable_threshold_for_belief(agent, belief):
+            belief.status = BeliefStatus.PROTO
+            revision_outcome = RevisionOutcome.WEAKENED
+
+    if belief.confidence >= _belief_lock_confidence_threshold() and belief.coherence >= _belief_lock_coherence_threshold():
+        belief.status = BeliefStatus.LOCKED
+    elif belief.confidence >= _stable_threshold_for_belief(agent, belief):
+        if belief.status == BeliefStatus.PROTO:
+            belief.status = BeliefStatus.STABLE
+
+    bucket_name = "proto"
+    if belief.status == BeliefStatus.STABLE:
+        bucket_name = "stable"
+    elif belief.status == BeliefStatus.LOCKED:
+        bucket_name = "locked"
+
+    belief.last_revised_tick = tick
+    belief.validate()
+    _set_belief_bucket(agent, belief_id, belief, bucket_name)
+
+    reflection.reflection_history.append(
+        ReflectionEvent(
+            tick=tick,
+            target_belief=belief_id,
+            trigger_type=TriggerType.CONTRADICTION if ratio >= 0.5 else TriggerType.FAILURE,
+            old_confidence=old_confidence,
+            new_confidence=belief.confidence,
+            revision_outcome=revision_outcome,
+        )
+    )
+    if len(reflection.reflection_history) > 256:
+        reflection.reflection_history = reflection.reflection_history[-256:]
+
+    reflection.validate()
+
+
 # =====================================================================
 # 6. SUBORDINATE NARRATION + SOCIAL STATE UPDATES
 # =====================================================================
@@ -1610,6 +1944,10 @@ def _simulation_configuration_snapshot() -> Dict[str, Any]:
             "sim_vectorize_sensorium": _vectorized_sensorium_enabled(),
             "sim_sparse_inference": _sparse_inference_enabled(),
             "sim_sparse_novelty_threshold": _sparse_novelty_threshold(),
+            "sim_memory_salience_bias": _belief_memory_bias(),
+            "sim_belief_revision_trigger": _belief_revision_trigger_tension(),
+            "sim_belief_lock_confidence": _belief_lock_confidence_threshold(),
+            "sim_belief_lock_coherence": _belief_lock_coherence_threshold(),
         },
         "world_cycles": {
             "time_of_day": [entry.value for entry in TIME_CYCLE],
@@ -1866,6 +2204,10 @@ def run_simulation_tick(world: World) -> None:
         # Phase 5: consolidate discovery from perception-action-outcome tuple.
         phase5_discovery_consolidation(agent, perception, proposal, outcome, current_tick)
 
+        # Phase 5.5-5.6: promote discoveries into beliefs, then run revision under contradiction pressure.
+        phase5_belief_promotion(agent, current_tick)
+        phase5_belief_revision(agent, current_tick)
+
         # Subordinate update: narration + social valence integration.
         update_narration_and_social_state(agent, perception, proposal, outcome, current_tick)
 
@@ -1885,6 +2227,13 @@ def run_simulation_tick(world: World) -> None:
                 },
                 "phase_4_outcome": outcome,
                 "phase_5_discoveries_locked": list(agent.discovery_graph.stabilized_relations),
+                "phase_5_belief_summary": {
+                    "proto": len(agent.belief_graph.proto_beliefs),
+                    "stable": len(agent.belief_graph.stable_beliefs),
+                    "locked": len(agent.belief_graph.locked_convictions),
+                    "belief_tension": agent.reflection_graph.belief_tension,
+                    "revision_pressure": agent.reflection_graph.revision_pressure,
+                },
                 "somatic": {
                     "energy": agent.body_graph.states.energy_level,
                     "hydration": agent.body_graph.states.hydration_level,
