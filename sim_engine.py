@@ -43,6 +43,59 @@ def _runtime_validation_enabled() -> bool:
     return os.getenv("SIM_VALIDATE_TICKS", "0") == "1"
 
 
+def _interpreter_enabled() -> bool:
+    return os.getenv("SIM_ENABLE_INTERPRETER", "0") == "1"
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, parsed)
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(parsed) or math.isinf(parsed):
+        return default
+    return max(minimum, parsed)
+
+
+def _inference_timeout_seconds() -> float:
+    return _env_float("SIM_INFERENCE_TIMEOUT_SECONDS", 12.0, minimum=1.0)
+
+
+def _inference_cooldown_ticks() -> int:
+    return _env_int("SIM_INFERENCE_COOLDOWN_TICKS", 2, minimum=0)
+
+
+def _interpreter_timeout_seconds() -> float:
+    return _env_float("SIM_INTERPRETER_TIMEOUT_SECONDS", 8.0, minimum=1.0)
+
+
+def _interpreter_cooldown_ticks() -> int:
+    return _env_int("SIM_INTERPRETER_COOLDOWN_TICKS", 8, minimum=0)
+
+
+def _interpreter_interval_ticks() -> int:
+    return _env_int("SIM_INTERPRETER_INTERVAL_TICKS", 5, minimum=1)
+
+
+INTERPRETER_BOOTSTRAP_EVENT_ID = "simulation_bootstrap"
+_INFERENCE_COOLDOWN_UNTIL_TICK = -1
+_INTERPRETER_COOLDOWN_UNTIL_TICK = -1
+
+
 # =====================================================================
 # 1. PHASE 1 - WORLD UPDATE (CANONICAL REALITY ADVANCES FIRST)
 # =====================================================================
@@ -649,9 +702,14 @@ def _heuristic_proposal(agent: AgentGraph, visible_map: Dict[str, Any]) -> TickA
 
 
 def query_agent_inference(agent: AgentGraph, perception: Dict[str, Any], tick: int) -> TickActionProposal:
+    global _INFERENCE_COOLDOWN_UNTIL_TICK
+
     visible_map = perception.get("visible_map", {}) if isinstance(perception, dict) else {}
 
     if os.getenv("SIM_FORCE_HEURISTIC", "0") == "1":
+        return _heuristic_proposal(agent, visible_map)
+
+    if tick <= _INFERENCE_COOLDOWN_UNTIL_TICK:
         return _heuristic_proposal(agent, visible_map)
 
     system_containment_rules = """
@@ -688,11 +746,12 @@ def query_agent_inference(agent: AgentGraph, perception: Dict[str, Any], tick: i
 
     try:
         model_name = os.getenv("OLLAMA_MODEL", "mistral").strip() or "mistral"
+        inference_timeout = _inference_timeout_seconds()
         host = os.getenv("OLLAMA_HOST")
         if host:
-            client = ollama.Client(host=host, timeout=20.0)
+            client = ollama.Client(host=host, timeout=inference_timeout)
         else:
-            client = ollama.Client(timeout=20.0)
+            client = ollama.Client(timeout=inference_timeout)
 
         response = client.chat(
             model=model_name,
@@ -709,6 +768,10 @@ def query_agent_inference(agent: AgentGraph, perception: Dict[str, Any], tick: i
             return _heuristic_proposal(agent, visible_map)
         return _proposal_from_parsed(parsed)
     except Exception:
+        _INFERENCE_COOLDOWN_UNTIL_TICK = max(
+            _INFERENCE_COOLDOWN_UNTIL_TICK,
+            tick + _inference_cooldown_ticks(),
+        )
         return _heuristic_proposal(agent, visible_map)
 
 
@@ -1238,6 +1301,279 @@ def update_narration_and_social_state(
 # =====================================================================
 
 
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+
+    enum_value = getattr(value, "value", None)
+    if isinstance(enum_value, (bool, int, float, str)):
+        return enum_value
+
+    return str(value)
+
+
+def _serialize_world_snapshot(world: World) -> Dict[str, Any]:
+    world_state = world.world_state
+    serialized_entities: Dict[str, Any] = {}
+    serialized_agents: Dict[str, Any] = {}
+
+    for entity_id, entity in world.environment_graph.items():
+        serialized_entities[entity_id] = {
+            "entity_class": entity.entity_class.value,
+            "entity_kind": entity.entity_kind,
+            "exists": entity.exists,
+            "location": {"x": entity.location.x, "y": entity.location.y},
+            "state": _json_safe(entity.state),
+            "properties": _json_safe(entity.properties),
+            "affordances": _json_safe(entity.affordances),
+            "availability": entity.availability,
+            "danger_level": entity.danger_level,
+            "resource_value": entity.resource_value,
+        }
+
+    for agent_id, agent in world.agent_graphs.items():
+        states = agent.body_graph.states
+        drives = agent.body_graph.drives
+        identity = agent.identity_graph
+        profile = identity.cognitive_profile
+
+        serialized_agents[agent_id] = {
+            "identity": {
+                "agent_id": identity.agent_id,
+                "alive": identity.alive,
+                "sex": identity.sex.value,
+                "age_ticks": identity.age_ticks,
+                "age_stage": identity.age_stage.value,
+                "location": {"x": identity.body_location.x, "y": identity.body_location.y},
+            },
+            "body": {
+                "energy_level": states.energy_level,
+                "hydration_level": states.hydration_level,
+                "fatigue_level": states.fatigue_level,
+                "pain_level": states.pain_level,
+                "hunger_level": states.hunger_level,
+                "thirst_level": states.thirst_level,
+                "threat_response": states.threat_response,
+            },
+            "drives": {
+                "drive_eat": drives.drive_eat,
+                "drive_drink": drives.drive_drink,
+                "drive_sleep": drives.drive_sleep,
+                "drive_flee": drives.drive_flee,
+                "drive_contact": drives.drive_contact,
+            },
+            "cognitive_profile": {
+                "narration_baseline": profile.narration_baseline,
+                "reflection_capacity": profile.reflection_capacity,
+                "abstraction_capacity": profile.abstraction_capacity,
+            },
+        }
+
+    return {
+        "world_state": {
+            "tick": world_state.tick,
+            "time_of_day": world_state.time_of_day.value,
+            "season": world_state.season.value,
+            "temperature": world_state.temperature,
+            "weather": world_state.weather.value,
+            "resource_pressure": world_state.resource_pressure,
+            "population_count": world_state.population_count,
+            "birth_count": world_state.birth_count,
+            "death_count": world_state.death_count,
+        },
+        "environment_graph": serialized_entities,
+        "agent_graphs": serialized_agents,
+    }
+
+
+def _simulation_configuration_snapshot() -> Dict[str, Any]:
+    inference_model = os.getenv("OLLAMA_MODEL", "mistral").strip() or "mistral"
+    interpreter_model = os.getenv("OLLAMA_INTERPRETER_MODEL", "sim-interpreter").strip() or "sim-interpreter"
+
+    return {
+        "runtime": {
+            "sim_force_heuristic": os.getenv("SIM_FORCE_HEURISTIC", "0") == "1",
+            "sim_validate_ticks": _runtime_validation_enabled(),
+            "sim_enable_interpreter": _interpreter_enabled(),
+            "inference_model": inference_model,
+            "interpreter_model": interpreter_model,
+            "sim_inference_timeout_seconds": _inference_timeout_seconds(),
+            "sim_inference_cooldown_ticks": _inference_cooldown_ticks(),
+            "sim_interpreter_timeout_seconds": _interpreter_timeout_seconds(),
+            "sim_interpreter_cooldown_ticks": _interpreter_cooldown_ticks(),
+            "sim_interpreter_interval_ticks": _interpreter_interval_ticks(),
+        },
+        "world_cycles": {
+            "time_of_day": [entry.value for entry in TIME_CYCLE],
+            "season": [entry.value for entry in SEASON_CYCLE],
+            "weather": [entry.value for entry in WEATHER_CYCLE],
+        },
+        "action_space": [action.value for action in PhysicalActionType],
+        "direction_space": [direction.value for direction in DirectionType],
+        "concept_space": [target.value for target in ConceptTarget],
+    }
+
+
+def _ensure_interpreter_bootstrap_event(world: World) -> None:
+    for event in world.event_log:
+        if event.event_id == INTERPRETER_BOOTSTRAP_EVENT_ID and event.event_type == "simulation_bootstrap":
+            return
+
+    world.event_log.append(
+        EventRecord(
+            event_id=INTERPRETER_BOOTSTRAP_EVENT_ID,
+            tick=world.world_state.tick,
+            event_type="simulation_bootstrap",
+            participants=list(world.agent_graphs.keys()),
+            location=Vec2(0.0, 0.0),
+            payload={
+                "initial_sim_state": _serialize_world_snapshot(world),
+                "simulation_configuration": _simulation_configuration_snapshot(),
+            },
+        )
+    )
+
+
+def _build_interpreter_tick_payload(world: World, tick: int, tick_events: List[EventRecord]) -> Dict[str, Any]:
+    initial_state: Dict[str, Any] = {}
+    simulation_configuration: Dict[str, Any] = _simulation_configuration_snapshot()
+
+    for event in world.event_log:
+        if event.event_id != INTERPRETER_BOOTSTRAP_EVENT_ID or event.event_type != "simulation_bootstrap":
+            continue
+
+        if isinstance(event.payload, dict):
+            if isinstance(event.payload.get("initial_sim_state"), dict):
+                initial_state = _json_safe(event.payload["initial_sim_state"])
+            if isinstance(event.payload.get("simulation_configuration"), dict):
+                simulation_configuration = _json_safe(event.payload["simulation_configuration"])
+        break
+
+    tick_event_summaries: List[Dict[str, Any]] = []
+    for event in tick_events:
+        tick_event_summaries.append(
+            {
+                "event_id": event.event_id,
+                "event_type": event.event_type,
+                "participants": list(event.participants),
+                "location": {"x": event.location.x, "y": event.location.y},
+                "payload": _json_safe(event.payload),
+            }
+        )
+
+    return {
+        "tick": tick,
+        "initial_sim_state": initial_state,
+        "simulation_configuration": simulation_configuration,
+        "current_world_state": _serialize_world_snapshot(world),
+        "tick_events": tick_event_summaries,
+    }
+
+
+def _heuristic_interpreter_summary(payload: Dict[str, Any]) -> str:
+    tick = int(payload.get("tick", 0))
+    world_state = payload.get("current_world_state", {}).get("world_state", {})
+    event_count = len(payload.get("tick_events", []))
+
+    return (
+        "Reality update: "
+        f"tick={tick}, time_of_day={world_state.get('time_of_day', 'unknown')}, "
+        f"season={world_state.get('season', 'unknown')}, weather={world_state.get('weather', 'unknown')}. "
+        "Interpreter context coverage: "
+        f"initial_state={'yes' if bool(payload.get('initial_sim_state')) else 'no'}, "
+        f"configuration={'yes' if bool(payload.get('simulation_configuration')) else 'no'}, "
+        f"tick_events={event_count}."
+    )
+
+
+def _query_tick_interpreter(payload: Dict[str, Any]) -> str:
+    global _INTERPRETER_COOLDOWN_UNTIL_TICK
+
+    tick = int(payload.get("tick", 0))
+    if tick <= _INTERPRETER_COOLDOWN_UNTIL_TICK:
+        return _heuristic_interpreter_summary(payload)
+
+    system_instruction = """
+    You are the simulation interpreter for a deterministic, graph-based world.
+    Use initial_sim_state and simulation_configuration as baseline context.
+    Explain what changed this tick relative to that baseline and avoid invention.
+    If required context is missing, state what is missing.
+    Keep output concise plain text with labels.
+    """
+
+    user_query = f"""
+    Interpret this simulation payload:
+    {json.dumps(payload)}
+
+    Use this structure:
+    1) Reality update
+    2) Body pressure
+    3) Perception and action
+    4) Discovery consolidation
+    5) Social and narration
+    """
+
+    try:
+        model_name = os.getenv("OLLAMA_INTERPRETER_MODEL", "sim-interpreter").strip() or "sim-interpreter"
+        interpreter_timeout = _interpreter_timeout_seconds()
+        host = os.getenv("OLLAMA_HOST")
+        if host:
+            client = ollama.Client(host=host, timeout=interpreter_timeout)
+        else:
+            client = ollama.Client(timeout=interpreter_timeout)
+
+        response = client.chat(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": user_query},
+            ],
+            options={"temperature": 0.1, "top_p": 0.2, "num_predict": 280},
+        )
+
+        summary = str(response.get("message", {}).get("content", "")).strip()
+        return summary or _heuristic_interpreter_summary(payload)
+    except Exception:
+        _INTERPRETER_COOLDOWN_UNTIL_TICK = max(
+            _INTERPRETER_COOLDOWN_UNTIL_TICK,
+            tick + _interpreter_cooldown_ticks(),
+        )
+        return _heuristic_interpreter_summary(payload)
+
+
+def _append_interpreter_summary_event(world: World, tick: int, tick_events: List[EventRecord]) -> None:
+    if not _interpreter_enabled():
+        return
+
+    interval = _interpreter_interval_ticks()
+    if interval > 1 and (tick % interval != 0):
+        return
+
+    payload = _build_interpreter_tick_payload(world, tick, tick_events)
+    summary = _query_tick_interpreter(payload)
+    world.event_log.append(
+        EventRecord(
+            event_id=f"interpreter_tick_{tick}",
+            tick=tick,
+            event_type="interpreter_summary",
+            participants=[],
+            location=Vec2(0.0, 0.0),
+            payload={
+                "summary": summary,
+                "source_event_ids": [event.event_id for event in tick_events],
+                "context_coverage": {
+                    "initial_sim_state": bool(payload.get("initial_sim_state")),
+                    "simulation_configuration": bool(payload.get("simulation_configuration")),
+                },
+            },
+        )
+    )
+
+
 def export_agent_visible_state(agent: AgentGraph, world: World) -> Dict[str, Any]:
     agent.validate()
     world.validate()
@@ -1269,9 +1605,12 @@ def export_agent_visible_state(agent: AgentGraph, world: World) -> Dict[str, Any
 
 
 def run_simulation_tick(world: World) -> None:
+    _ensure_interpreter_bootstrap_event(world)
+
     # Phase 1: world reality advances independent of agents.
     phase1_world_update(world)
     current_tick = world.world_state.tick
+    tick_events: List[EventRecord] = []
 
     world.world_state.birth_count = 0
     world.world_state.death_count = 0
@@ -1301,34 +1640,35 @@ def run_simulation_tick(world: World) -> None:
         # Subordinate update: narration + social valence integration.
         update_narration_and_social_state(agent, perception, proposal, outcome, current_tick)
 
-        world.event_log.append(
-            EventRecord(
-                event_id=f"{agent_id}_tick_{current_tick}",
-                tick=current_tick,
-                event_type="tick_pipeline",
-                participants=[agent_id] + list(perception.get("visible_social", [])),
-                location=Vec2(agent.identity_graph.body_location.x, agent.identity_graph.body_location.y),
-                payload={
-                    "phase_3_primary_attention": agent.experience_graph.primary_attention,
-                    "phase_4_action": {
-                        "physical_action": proposal.physical_action.value,
-                        "target_id": proposal.target_id,
-                        "direction": proposal.direction.value,
-                        "intensity": proposal.intensity,
-                    },
-                    "phase_4_outcome": outcome,
-                    "phase_5_discoveries_locked": list(agent.discovery_graph.stabilized_relations),
-                    "somatic": {
-                        "energy": agent.body_graph.states.energy_level,
-                        "hydration": agent.body_graph.states.hydration_level,
-                        "fatigue": agent.body_graph.states.fatigue_level,
-                        "pain": agent.body_graph.states.pain_level,
-                    },
+        tick_event = EventRecord(
+            event_id=f"{agent_id}_tick_{current_tick}",
+            tick=current_tick,
+            event_type="tick_pipeline",
+            participants=[agent_id] + list(perception.get("visible_social", [])),
+            location=Vec2(agent.identity_graph.body_location.x, agent.identity_graph.body_location.y),
+            payload={
+                "phase_3_primary_attention": agent.experience_graph.primary_attention,
+                "phase_4_action": {
+                    "physical_action": proposal.physical_action.value,
+                    "target_id": proposal.target_id,
+                    "direction": proposal.direction.value,
+                    "intensity": proposal.intensity,
                 },
-            )
+                "phase_4_outcome": outcome,
+                "phase_5_discoveries_locked": list(agent.discovery_graph.stabilized_relations),
+                "somatic": {
+                    "energy": agent.body_graph.states.energy_level,
+                    "hydration": agent.body_graph.states.hydration_level,
+                    "fatigue": agent.body_graph.states.fatigue_level,
+                    "pain": agent.body_graph.states.pain_level,
+                },
+            },
         )
+        world.event_log.append(tick_event)
+        tick_events.append(tick_event)
 
     world.world_state.population_count = sum(1 for a in world.agent_graphs.values() if a.identity_graph.alive)
+    _append_interpreter_summary_event(world, current_tick, tick_events)
     if _runtime_validation_enabled():
         world.validate()
 
@@ -1390,6 +1730,11 @@ if __name__ == "__main__":
 
     print("--- RUNNING MODULAR FIVE-PHASE TICK ENGINE ---")
     print(f"[Inference Mode] SIM_FORCE_HEURISTIC={os.getenv('SIM_FORCE_HEURISTIC', '0')}")
+    print(
+        "[Interpreter Mode] "
+        f"SIM_ENABLE_INTERPRETER={os.getenv('SIM_ENABLE_INTERPRETER', '0')} "
+        f"OLLAMA_INTERPRETER_MODEL={os.getenv('OLLAMA_INTERPRETER_MODEL', 'sim-interpreter')}"
+    )
 
     for step in range(1, 6):
         if step == 2:
@@ -1426,6 +1771,18 @@ if __name__ == "__main__":
                 f"mode={instance.narration_graph.internal_processing_mode.value}"
             )
             print(f"    - Locked Discoveries: {instance.discovery_graph.stabilized_relations}")
+
+        if _interpreter_enabled():
+            interpreter_event = next(
+                (
+                    event
+                    for event in reversed(sim_world.event_log)
+                    if event.event_type == "interpreter_summary" and event.tick == sim_world.world_state.tick
+                ),
+                None,
+            )
+            if interpreter_event is not None:
+                print(f"  * Interpreter Summary: {interpreter_event.payload.get('summary', '')}")
 
         time.sleep(0.2)
 

@@ -60,6 +60,26 @@ services:
       SIM_FORCE_HEURISTIC: "1"
     restart: "no"
 
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "dashboard_cli.py"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: mistral
+      OLLAMA_INTERPRETER_MODEL: sim-interpreter
+      SIM_FORCE_HEURISTIC: "1"
+      SIM_ENABLE_INTERPRETER: "0"
+      SIM_INFERENCE_TIMEOUT_SECONDS: "12"
+      SIM_INFERENCE_COOLDOWN_TICKS: "2"
+      SIM_INTERPRETER_TIMEOUT_SECONDS: "8"
+      SIM_INTERPRETER_COOLDOWN_TICKS: "8"
+      SIM_INTERPRETER_INTERVAL_TICKS: "5"
+    stdin_open: true
+    tty: true
+    restart: "no"
+
   simulation-llm:
     build:
       context: .
@@ -68,7 +88,14 @@ services:
     environment:
       OLLAMA_HOST: http://ollama:11434
       OLLAMA_MODEL: mistral
+      OLLAMA_INTERPRETER_MODEL: sim-interpreter
       SIM_FORCE_HEURISTIC: "0"
+      SIM_ENABLE_INTERPRETER: "1"
+      SIM_INFERENCE_TIMEOUT_SECONDS: "12"
+      SIM_INFERENCE_COOLDOWN_TICKS: "2"
+      SIM_INTERPRETER_TIMEOUT_SECONDS: "8"
+      SIM_INTERPRETER_COOLDOWN_TICKS: "8"
+      SIM_INTERPRETER_INTERVAL_TICKS: "5"
     depends_on:
       ollama-interpreter-init:
         condition: service_completed_successfully
