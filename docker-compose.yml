@@ -36,7 +36,17 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
+      SIM_FORCE_HEURISTIC: "1"
+    restart: "no"
+
+  simulation-llm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["llm"]
+    environment:
       OLLAMA_HOST: http://ollama:11434
+      SIM_FORCE_HEURISTIC: "0"
     depends_on:
       ollama-pull:
         condition: service_completed_successfully
